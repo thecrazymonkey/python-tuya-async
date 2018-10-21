@@ -112,7 +112,7 @@ class MessageParser(object):
     def __init__(self, dev_type = None):
         self.dev_type = dev_type
 
-    def generate_payload(self, command, options = None):
+    def generate_payload(self, command, options, data = None):
         """
         Generate the payload to send.
 
@@ -135,8 +135,8 @@ class MessageParser(object):
         if 't' in json_data:
             json_data['t'] = str(int(time.time()))
 
-        if options is not None and "data" in options:
-            json_data['dps'] = options["data"]
+        if data is not None:
+            json_data['dps'] = data
 
         # Create byte buffer from hex data
         json_payload = json.dumps(json_data)
@@ -343,7 +343,6 @@ class TuyaDevice(asyncio.Protocol):
 
     async def status(self):
         log.debug('TuyaDevice:status()')
-        self.options.pop('data', None)
         payload = self.parser.generate_payload('status', self.options)
         self.send_data(payload)
 
@@ -357,8 +356,7 @@ class TuyaDevice(asyncio.Protocol):
         log.debug('TuyaDevice:set_status() entry')
         if isinstance(switch, int):
             switch = str(switch)  # index and payload is a string
-        self.options["data"] = {switch:on}
-        payload = self.parser.generate_payload(SET, self.options)
+        payload = self.parser.generate_payload(SET, self.options, {switch:on})
         self.send_data(payload)
 
     async def turn_on(self, switch=1):
