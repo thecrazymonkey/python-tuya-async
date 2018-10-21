@@ -1,5 +1,0 @@
-aiotuya/__init__.py
-aiotuya.egg-info/PKG-INFO
-aiotuya.egg-info/SOURCES.txt
-aiotuya.egg-info/dependency_links.txt
-aiotuya.egg-info/top_level.txt
