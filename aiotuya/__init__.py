@@ -32,6 +32,8 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+logging.basicConfig()  # TODO include function name/line numbers in log
+log.setLevel(level=logging.DEBUG)  # Debug hack!
 
 log.debug('Python %s on %s', sys.version, sys.platform)
 if Crypto is None:
@@ -58,6 +60,12 @@ payload_dict = {
     "set": {
       "hexByte": "07",
       "command": {"devId": "", "uid": "", "t": ""}
+    },
+    "echo": {
+      # 000055aa 00000000 000000 09 0000000c 00000000b051ab030000aa55
+      "hexByte": "09",
+      "command": {},
+      "buffer" : '000055aa00000000000000090000000c00000000b051ab030000aa55'
     },
     "prefix": "000055aa"+"00000000"+"000000",    # Next byte is command byte ("hexByte") some zero padding, then length of remaining payload, i.e. command + suffix (unclear if multiple bytes used for length, zero padding implies could be more than one byte)
     "suffix": "000000000000aa55"
@@ -145,6 +153,10 @@ class MessageParser(object):
         json_payload = json_payload.encode('utf-8')
         log.debug('json_payload=%r', json_payload)
 
+        if command == 'echo':
+            buffer = hex2bin(payload_dict[self.dev_type][command]['buffer'])
+            return buffer
+
         if command == SET:
             # need to encrypt
             #print('json_payload %r' % json_payload)
@@ -200,53 +212,69 @@ class MessageParser(object):
         """
         # nothing received
         if (data == None):
-            return (True, data,None)
+            return
 
         # Check for length
         if (len(data) < 16):
-            log.debug('Packet too small. Length: %d', len(data))
-            return (True, data, None)
+            log.warn('Message size to small')
+            return
 
-        if (data.startswith(b'\x00\x00U\xaa') == False):
-            raise ValueError('Magic prefix mismatch : %s',data)
+        # as the data can come bundled we need to loop extract
+        while len(data) > 0:
+            log.debug('data = %s', data)
+            if (data.startswith(b'\x00\x00U\xaa') == False):
+                log.warn('Magic prefix mismatch : %s',data)
+                # try finding next message, yield error
+                i = data.find(b'\x00\x00U\xaa')
+                if i != -1:
+                    data = data[i:]
+                    yield(False, None, None)
+                else:
+                    return
 
-        if (data.endswith(b'\x00\x00\xaaU') == False):
-            raise ValueError('Magic suffix mismatch : %s',data)
+            command = struct.unpack_from('>I',data,8)[0]
+            log.debug('command = %i', command)
 
-        command = struct.unpack_from('>I',data,8)[0]
-        log.debug('command = %i', command)
+            payloadSize = struct.unpack_from('>I',data,12)[0]
+            log.debug('payloadSize = %i', payloadSize)
 
-        payloadSize = struct.unpack_from('>I',data,12)[0]
-        log.debug('payloadSize = %i', payloadSize)
+            # Check for payload
+            if (len(data) - 8 < payloadSize):
+                log.warn('Corrupted packet missing payload. %i;%i', len(data), payloadSize)
+                # try finding next message, yield error
+                i = data.find(b'\x00\x00U\xaa')
+                if i != -1:
+                    data = data[i:]
+                    yield(False, None, None)
+                else:
+                    return
 
-        # Check for payload
-        if (len(data) - 8 < payloadSize):
-            log.debug('Packet missing payload. %i;%i', len(data), payloadSize)
-            return (True, data, None)
+            # extract payload without prefix, suffix, CRC
+            payload = data[20:20+payloadSize-12]
+            # now shift the buffer for next message if there is any
+            data = data[20+payloadSize-4:]
+            log.debug('payload = %s', payload)
+            log.debug('new data = %s', data)
+            # encrypted payload comes with version first
+            if (payload.startswith(PROTOCOL_VERSION_BYTES) == True):
+                # cut prefix and digest and decrypt
+                payload = payload[19:]
+                self.cipher = AESCipher(local_key)
+                payload = self.cipher.decrypt(payload)
+                log.debug('Decrypted payload = %s', payload)
+                self.cipher = None
+            else:
+                payload = payload.decode().lstrip('\x00')
 
-        # extract payload without prefix, suffix, CRC
-        payload = data[20:20+payloadSize-12]
-        log.debug('payload = %s', payload)
-        # encrypted payload comes with version first
-        if (payload.startswith(PROTOCOL_VERSION_BYTES) == True):
-            # cut prefix and digest and decrypt
-            payload = payload[19:]
-            self.cipher = AESCipher(local_key)
-            payload = self.cipher.decrypt(payload)
-            log.debug('Decrypted payload = %s', payload)
-            self.cipher = None
-        else:
-            payload = payload.decode().lstrip('\x00')
+            try:
+                payload = json.loads(payload)
+            except json.decoder.JSONDecodeError as e:
+                # warning if this is not an ack or echo
+                if command not in (7,9):
+                    log.warn('JSON payload empty. %s;%s', payload, e)
+            log.debug('JSON payload = %s', payload)
 
-        try:
-            payload = json.loads(payload)
-        except json.decoder.JSONDecodeError as e:
-            # warning if this is not an ack
-            if command != 7:
-                log.warn('JSON payload empty. %s;%s', payload, e)
-        log.debug('JSON payload = %s', payload)
-
-        return (False, payload, command)
+            yield (False, payload, command)
 
 
 def bin2hex(x, pretty=False):
@@ -298,26 +326,27 @@ class TuyaDevice(asyncio.Protocol):
         self.loop = loop
         self.transport = None
         self.parent = parent
+        self.init_done = False
 
     def connection_made(self, transport):
         log.debug('TuyaDevice:connection_made()')
         if self.transport is None:
             self.transport = transport
             # call on first connect to get the right status
-            self.parent.on_init()
+            if self.init_done == False:
+                self.parent.on_init()
+                self.init_done= True
             self.parent.register_job(self.status())
-        else:
-            self.transport = transport
         log.debug('TuyaDevice:connection_made() - end')
 
     def data_received(self, data):
         log.debug('TuyaDevice:data_received(): %s',data)
-        (error,result,command) = self.parser.extract_payload(data, self.local_key)
-        # if ok and not just command ack (7)
-        if error == False and command != 7:
-            # check what we got - pass structure on, else nothing to do
-            if type(result) is dict:
-                self.parent.data_parsed(result)
+        for (error,result,command) in self.parser.extract_payload(data, self.local_key):
+            # if ok and not just command ack (7)
+            if error == False and command != 7:
+                # check what we got - pass structure on, else nothing to do
+                if type(result) is dict:
+                    self.parent.data_parsed(result)
         log.debug('TuyaDevice:data_received() - end')
 
 
@@ -325,11 +354,33 @@ class TuyaDevice(asyncio.Protocol):
         log.error('TuyaDevice:connection_lost(): %s', exc)
         # need reconnect if died due exception
         if exc != '':
+            time.sleep(1)
+            self.transport = None
             self.parent.on_connection_lost(exc)
+            self.reconnect()
+            log.debug('TuyaDevice:connection_lost() - end')
+
+    async def connect_check(self, _):
+        log.debug('TuyaDevice:connect_check()')
+        if self.transport == None:
+            self.reconnect()
+        log.debug('TuyaDevice:connect_check() - end')
+
+    def connect(self):
+        log.debug('TuyaDevice:connect()')
+        try:
             coro = self.loop.create_connection(lambda: self.tuyadevice,
-                             self.address, 6668)
-            self.parent.register_job(coro)
-            log.debug('New connection attempted - added job')
+                         self.address, 6668)
+            return coro
+        except Exception as exc:
+            log.error('TuyaDevice:connect():exception %s', exc)
+
+    def reconnect(self):
+        log.debug('TuyaDevice:reconnect()')
+        coro = self.connect()
+        self.parent.register_job(coro)
+        self.parent.register_job(self.connect_check, 30)
+        log.debug('TuyaDevice:reconnect() - added job')
 
     def send_data(self, data):
         log.debug('TuyaDevice:send_data() %s', data)
@@ -344,6 +395,11 @@ class TuyaDevice(asyncio.Protocol):
     async def status(self):
         log.debug('TuyaDevice:status()')
         payload = self.parser.generate_payload('status', self.options)
+        self.send_data(payload)
+
+    async def echo(self):
+        log.debug('TuyaDevice:echo()')
+        payload = self.parser.generate_payload('echo', self.options)
         self.send_data(payload)
 
     async def set_status(self, on, switch=1):
@@ -381,6 +437,7 @@ def resolveId(thisId) -> str:
     log.debug('resolveId()')
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(5)
+    done = False
     try:
         log.debug('Binding to local port %d', RESOLVE_PORT)
         sock.bind(('<broadcast>', RESOLVE_PORT))
@@ -388,21 +445,22 @@ def resolveId(thisId) -> str:
         pass
     # get it to run for 5 seconds to allow all switches to report
     t_end = time.time() + 5
-    while time.time() < t_end:
+    while time.time() < t_end and done == False:
         try:
             data, addr = sock.recvfrom(2048)
             log.debug('Received=%s:%s', data, addr)
-            (error,result,command) = MessageParser().extract_payload(data)
+            for (error,result,command) in MessageParser().extract_payload(data):
+                if(error == False):
+                    log.debug('Resolve string=%s (command:%i)', result, command)
+                    if (result['gwId'] == thisId):
+                        # Add IP
+                        thisIP = result['ip']
+                        done = True
+                        break
         except socket.timeout:
             log.error('No data received during resolveId call')
             error = True
 
-        if(error == False):
-            log.debug('Resolve string=%s (command:%i)', result, command)
-            if (result['gwId'] == thisId):
-                # Add IP
-                thisIP = result['ip']
-                break
     sock.close()
     log.debug('Resolved IP=%s', thisIP)
     return thisIP
