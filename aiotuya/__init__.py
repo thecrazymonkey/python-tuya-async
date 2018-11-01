@@ -225,11 +225,12 @@ class MessageParser(object):
             if (data.startswith(b'\x00\x00U\xaa') == False):
                 log.warn('Magic prefix mismatch : %s',data)
                 # try finding next message, yield error
-                i = data.find(b'\x00\x00U\xaa')
+                i = data.find(b'\x00\x00U\xaa',1)
                 if i != -1:
                     data = data[i:]
                     yield(False, None, None)
                 else:
+                    data = b''
                     return
 
             command = struct.unpack_from('>I',data,8)[0]
@@ -242,11 +243,12 @@ class MessageParser(object):
             if (len(data) - 8 < payloadSize):
                 log.warn('Corrupted packet missing payload. %i;%i', len(data), payloadSize)
                 # try finding next message, yield error
-                i = data.find(b'\x00\x00U\xaa')
+                i = data.find(b'\x00\x00U\xaa',1)
                 if i != -1:
                     data = data[i:]
                     yield(False, None, None)
                 else:
+                    data = b''
                     return
 
             # extract payload without prefix, suffix, CRC
